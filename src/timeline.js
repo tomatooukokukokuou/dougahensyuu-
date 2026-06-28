@@ -347,10 +347,39 @@ export class Timeline {
       this.options.onSeek(seekTime);
     };
 
+    // 再生ヘッドのつまみ (ドラッグハンドル) のドラッグ処理
+    const playheadHandle = document.getElementById('playhead-handle');
+    if (playheadHandle) {
+      playheadHandle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        this.isDraggingPlayhead = true;
+        this.scrollContainer.classList.add('locked'); // 横スクロールをロック
+        
+        handleSeek(e.clientX);
+
+        const onPointerMove = (moveEvent) => {
+          moveEvent.preventDefault();
+          handleSeek(moveEvent.clientX);
+        };
+
+        const onPointerUp = () => {
+          this.isDraggingPlayhead = false;
+          this.scrollContainer.classList.remove('locked'); // ロック解除
+          document.removeEventListener('pointermove', onPointerMove);
+          document.removeEventListener('pointerup', onPointerUp);
+        };
+
+        document.addEventListener('pointermove', onPointerMove);
+        document.addEventListener('pointerup', onPointerUp);
+      });
+    }
+
     // トラック全体のクリック・タッチでシーク
     this.track.addEventListener('pointerdown', (e) => {
       // クリップ自体やトリミングハンドルのクリックは除外
-      if (e.target !== this.track && e.target !== this.playhead) return;
+      if (e.target !== this.track && e.target !== this.playhead && e.target !== playheadHandle) return;
       
       this.isDraggingPlayhead = true;
       handleSeek(e.clientX);

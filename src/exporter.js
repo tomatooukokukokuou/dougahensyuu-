@@ -169,8 +169,9 @@ export class VideoExporter {
 
           // クリップの再生時間（秒）
           const segmentDuration = clip.end - clip.start;
-          let segmentElapsedTime = 0;
-          const startRealTime = performance.now();
+          
+          let lastVideoTime = -1;
+          let lastStallCheckTime = performance.now();
 
           // Canvasへの描画ループ（クリップごと）
           await new Promise((resolveSegment) => {
@@ -184,14 +185,32 @@ export class VideoExporter {
               // Canvasに動画の現在のフレームを描画
               this.ctx.drawImage(this.videoEl, 0, 0, width, height);
 
+              const currentVideoTime = this.videoEl.currentTime;
+
               // 進捗の計算
-              const currentClipProgress = Math.min(this.videoEl.currentTime - clip.start, segmentDuration);
+              const currentClipProgress = Math.max(0, Math.min(currentVideoTime - clip.start, segmentDuration));
               const progressTime = currentVirtualTime + currentClipProgress;
               const percent = Math.min(Math.round((progressTime / totalDuration) * 100), 99);
               onProgress(percent);
 
-              // クリップの終了位置に達したか判定
-              if (this.videoEl.currentTime >= clip.end || this.videoEl.ended) {
+              // 進行が停止していないか（フリーズ防止安全策）
+              const now = performance.now();
+              if (currentVideoTime !== lastVideoTime) {
+                lastVideoTime = currentVideoTime;
+                lastStallCheckTime = now;
+              } else {
+                // currentTimeが進まずに500ms（0.5秒）以上経過した場合
+                if (now - lastStallCheckTime > 500) {
+                  console.warn('Video render stalled, forcing next clip.');
+                  this.videoEl.pause();
+                  currentVirtualTime += segmentDuration;
+                  resolveSegment();
+                  return;
+                }
+              }
+
+              // クリップの終了位置に達したか判定 (iPad/Safariの浮動小数点誤差を考慮して0.08秒手前で終了とみなす)
+              if (currentVideoTime >= clip.end - 0.08 || this.videoEl.ended) {
                 this.videoEl.pause();
                 currentVirtualTime += segmentDuration;
                 resolveSegment();

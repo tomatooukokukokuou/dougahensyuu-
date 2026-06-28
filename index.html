@@ -104,7 +104,9 @@
       <div class="timeline-scroll-container" id="timeline-scroll-container">
         <div class="timeline-track" id="timeline-track">
           <!-- クリップがJSで挿入される -->
-          <div class="playhead" id="playhead"></div>
+          <div class="playhead" id="playhead">
+            <div class="playhead-handle" id="playhead-handle"></div>
+          </div>
         </div>
       </div>
     </footer>
@@ -119,6 +121,29 @@
           <div id="export-progress" class="progress-bar"></div>
         </div>
         <span id="export-percentage">0%</span>
+      </div>
+    </div>
+
+    <!-- Restore Project Modal -->
+    <div id="restore-modal" class="modal">
+      <div class="modal-content">
+        <i data-lucide="history" style="width: 48px; height: 48px; color: var(--accent-color);"></i>
+        <h3>編集データの復元</h3>
+        <p>前回の編集データが見つかりました。復元するには、元の動画ファイルをもう一度選択してください。</p>
+        <div class="restore-file-box" style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); padding: 12px 18px; border-radius: 12px; width: 100%; text-align: left; margin: 10px 0;">
+          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">対象ファイル:</div>
+          <div id="restore-filename" style="font-weight: 600; color: var(--text-primary); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">-</div>
+        </div>
+        <div style="display: flex; gap: 12px; width: 100%;">
+          <label for="restore-file-import" class="btn btn-primary" style="flex: 1;">
+            <i data-lucide="upload-cloud"></i>
+            <span>ファイルを選択</span>
+            <input type="file" id="restore-file-import" accept="video/*" style="display: none;">
+          </label>
+          <button id="btn-restore-cancel" class="btn" style="background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); flex: 0.5;">
+            <span>破棄</span>
+          </button>
+        </div>
       </div>
     </div>
   </div>

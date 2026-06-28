@@ -481,21 +481,49 @@ body {
   width: 2px;
   background-color: var(--danger-color);
   z-index: 10;
-  pointer-events: none; /* クリックなどを透過 */
+  pointer-events: none; /* 線自体はクリック透過 */
   box-shadow: 0 0 8px var(--danger-color);
 }
 
-.playhead::before {
+/* 再生ヘッドのドラッグ用つまみ */
+.playhead-handle {
+  position: absolute;
+  top: -10px; /* タイムライントラックの上部から少し突き出す */
+  left: -11px; /* 24px幅のつまみが中心にくるように調整 */
+  width: 24px;
+  height: 24px;
+  background: var(--danger-color);
+  border: 3px solid #fff;
+  border-radius: 50%;
+  cursor: ew-resize;
+  z-index: 20;
+  pointer-events: auto; /* つまみだけタッチ可能にする */
+  touch-action: none; /* iOSのスクロールと競合するのを防止 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  transition: transform 0.1s ease, background-color 0.1s;
+}
+
+/* つまみのタッチ領域拡張 */
+.playhead-handle::after {
   content: '';
   position: absolute;
-  top: 0;
-  left: -6px;
-  width: 14px;
-  height: 14px;
-  background: var(--danger-color);
-  border-radius: 50% 50% 50% 0;
-  transform: rotate(-45deg);
-  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+  top: -12px;
+  left: -12px;
+  right: -12px;
+  bottom: -12px;
+}
+
+.playhead-handle:active {
+  transform: scale(1.2);
+  background: #fff;
+  border-color: var(--danger-color);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+}
+
+/* ドラッグ中にスクロールと競合するのを防ぐためのロッククラス */
+.timeline-scroll-container.locked {
+  overflow-x: hidden !important;
+  touch-action: none !important;
 }
 
 /* Clips */

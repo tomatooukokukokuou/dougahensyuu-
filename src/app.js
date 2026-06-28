@@ -23,6 +23,12 @@ const exportModal = document.getElementById('export-modal');
 const exportProgressBar = document.getElementById('export-progress');
 const exportPercentage = document.getElementById('export-percentage');
 
+// 復元用 UI 要素
+const restoreModal = document.getElementById('restore-modal');
+const restoreFilename = document.getElementById('restore-filename');
+const restoreFileImport = document.getElementById('restore-file-import');
+const btnRestoreCancel = document.getElementById('btn-restore-cancel');
+
 // モジュールの初期化
 const playerContainer = document.querySelector('.video-container');
 const timelineScrollContainer = document.getElementById('timeline-scroll-container');
@@ -110,12 +116,19 @@ function init() {
   if (window.lucide) {
     window.lucide.createIcons();
   }
+
+  // 起動時に自動保存データの有無をチェック
+  checkSavedProject();
 }
 
 // イベントリスナーの紐付け
 function setupEventListeners() {
   // 動画インポート
   videoImportInput.addEventListener('change', handleVideoImport);
+
+  // 復元処理
+  restoreFileImport.addEventListener('change', handleRestoreFileSelect);
+  btnRestoreCancel.addEventListener('click', discardSavedProject);
 
   // 再生/一時停止
   btnPlayPause.addEventListener('click', () => {
@@ -360,6 +373,9 @@ function updateState() {
   player.seek(currentVirtualTime);
 
   updateUI();
+
+  // 状態変更時に自動保存を実行
+  saveProject();
 }
 
 // ----------------------------------------------------
@@ -482,3 +498,139 @@ window.addEventListener('load', () => {
   window.addEventListener('resize', resetHeight);
   resetHeight();
 });
+
+// ----------------------------------------------------
+// プロジェクト自動保存・復元ロジック (途中保存機能)
+// ----------------------------------------------------
+
+/**
+ * プロジェクトの状態を localStorage にシリアライズして自動保存する
+ */
+function saveProject() {
+  if (clips.length === 0) {
+    localStorage.removeItem('cutcutter_project');
+    return;
+  }
+
+  // FileオブジェクトやObjectURLなどのシリアライズ不可能な情報を除外して保存
+  const serializedClips = clips.map(clip => ({
+    id: clip.id,
+    name: clip.name,
+    size: clip.file ? clip.file.size : 0, // ファイルマッチング用サイズ
+    duration: clip.duration,
+    start: clip.start,
+    end: clip.end
+  }));
+
+  const projectData = {
+    clips: serializedClips,
+    selectedClipId: selectedClipId,
+    currentVirtualTime: currentVirtualTime
+  };
+
+  localStorage.setItem('cutcutter_project', JSON.stringify(projectData));
+}
+
+/**
+ * 起動時に自動保存されたプロジェクトデータがあるか確認し、あれば復元UIを起動する
+ */
+function checkSavedProject() {
+  const savedDataRaw = localStorage.getItem('cutcutter_project');
+  if (!savedDataRaw) return;
+
+  try {
+    const savedData = JSON.parse(savedDataRaw);
+    if (savedData && savedData.clips && savedData.clips.length > 0) {
+      // 復元モーダルを表示
+      restoreModal.classList.add('active');
+      
+      // 最初に見つかるファイル名を表示
+      const firstClipName = savedData.clips[0].name;
+      restoreFilename.innerText = firstClipName;
+    }
+  } catch (err) {
+    console.error('Failed to parse saved project data:', err);
+    localStorage.removeItem('cutcutter_project');
+  }
+}
+
+/**
+ * 復元用ファイルが選択された際のマッチングと復元処理
+ */
+async function handleRestoreFileSelect(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const savedDataRaw = localStorage.getItem('cutcutter_project');
+  if (!savedDataRaw) {
+    restoreModal.classList.remove('active');
+    return;
+  }
+
+  try {
+    const savedData = JSON.parse(savedDataRaw);
+    const expectedName = savedData.clips[0].name;
+    const expectedSize = savedData.clips[0].size;
+
+    // ファイルマッチングの検証 (警告を出すが強制はしない)
+    if (file.name !== expectedName && Math.abs(file.size - expectedSize) > 1024) {
+      const confirmUse = confirm(
+        `選択されたファイル (${file.name}) は、保存されたファイル名 (${expectedName}) と一致しない可能性があります。\n本当にこのファイルで復元しますか？`
+      );
+      if (!confirmUse) {
+        restoreFileImport.value = '';
+        return;
+      }
+    }
+
+    // ロール開始表示
+    restoreFilename.innerText = '読み込み・復元中...';
+
+    const objectURL = URL.createObjectURL(file);
+    const actualDuration = await getVideoDuration(objectURL);
+
+    // 保存されていたメタデータに Blob 情報 (file, objectURL) を紐づける
+    clips = savedData.clips.map(savedClip => {
+      // 念のため、動画の長さが前と異なる場合は限界値を補正
+      const clipStart = Math.min(savedClip.start, actualDuration);
+      const clipEnd = Math.min(savedClip.end, actualDuration);
+      
+      return {
+        id: savedClip.id,
+        name: savedClip.name,
+        file: file,
+        objectURL: objectURL,
+        duration: actualDuration,
+        start: clipStart,
+        end: clipEnd
+      };
+    });
+
+    selectedClipId = savedData.selectedClipId;
+    currentVirtualTime = savedData.currentVirtualTime || 0;
+
+    // 状態を適用してUI更新
+    updateState();
+    
+    // モーダルを閉じる
+    restoreModal.classList.remove('active');
+    alert('プロジェクトを正常に復元しました！');
+  } catch (err) {
+    console.error('Failed to restore project:', err);
+    alert('復元中にエラーが発生しました。');
+    restoreFilename.innerText = '-';
+  } finally {
+    restoreFileImport.value = '';
+  }
+}
+
+/**
+ * 保存されたプロジェクトを破棄（クリア）する
+ */
+function discardSavedProject() {
+  const confirmDiscard = confirm('前回の編集データを破棄しますか？この操作は取り消せません。');
+  if (!confirmDiscard) return;
+
+  localStorage.removeItem('cutcutter_project');
+  restoreModal.classList.remove('active');
+}
