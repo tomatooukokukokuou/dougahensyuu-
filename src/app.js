@@ -309,7 +309,7 @@ function handleDelete() {
 }
 
 /**
- * 動画書き出し処理
+ * 動画書き出し処理（FFmpeg.wasm によるオリジナル画質書き出し）
  */
 function handleExport() {
   if (clips.length === 0) return;
@@ -322,6 +322,12 @@ function handleExport() {
   exportProgressBar.style.width = '0%';
   exportPercentage.innerText = '0%';
 
+  // モーダルの説明文を更新
+  const exportModalDesc = exportModal.querySelector('p');
+  if (exportModalDesc) {
+    exportModalDesc.innerText = 'FFmpeg.wasm を初回ロード中...（初回のみ数秒かかります）';
+  }
+
   // 書出し開始
   exporter.export(
     clips,
@@ -330,31 +336,46 @@ function handleExport() {
       // 進捗
       exportProgressBar.style.width = `${percent}%`;
       exportPercentage.innerText = `${percent}%`;
+
+      // モーダル説明文のフェーズ更新
+      if (exportModalDesc) {
+        if (percent < 8) {
+          exportModalDesc.innerText = 'FFmpeg.wasm を初回ロード中...（初回のみ数秒かかります）';
+        } else if (percent < 40) {
+          exportModalDesc.innerText = '元の動画データを読み込み中...';
+        } else if (percent < 90) {
+          exportModalDesc.innerText = 'クリップをカット・連結中...（再エンコードなし＝オリジナル画質）';
+        } else {
+          exportModalDesc.innerText = '出力ファイルを生成中...';
+        }
+      }
     },
     (blob) => {
       // 完了
       exportModal.classList.remove('active');
-      
+
       // ダウンロードリンクを生成して発火
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `edited_video_${Date.now()}.mp4`;
+      a.download = `cutcutter_${Date.now()}.mp4`;
       document.body.appendChild(a);
       a.click();
-      
+
       // 後片付け
       setTimeout(() => {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
       }, 100);
 
-      alert('動画の書き出しが完了しました！');
+      // ファイルサイズ表示（MB）
+      const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+      alert(`✅ 書き出し完了！\nオリジナル画質でMP4を保存しました。\nファイルサイズ: ${sizeMB} MB`);
     },
     (err) => {
       // エラー
       exportModal.classList.remove('active');
-      alert(`書き出し中にエラーが発生しました: ${err.message}`);
+      alert(`書き出し中にエラーが発生しました:\n${err.message}\n\n※ネットワーク接続を確認してください（FFmpeg.wasmのロードが必要です）`);
     }
   );
 }

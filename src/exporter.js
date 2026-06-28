@@ -1,278 +1,245 @@
 /**
- * iPad向け動画書き出し（Canvas + MediaRecorder）モジュール
+ * iPad向け動画書き出し（FFmpeg.wasm使用・オリジナル画質）モジュール
+ *
+ * Canvas+MediaRecorder方式（再エンコード、画質劣化）から
+ * FFmpeg.wasm の `-c copy` ストリームコピー方式（再エンコードなし、オリジナル画質）に変更。
+ *
+ * 使用ライブラリ:
+ *   @ffmpeg/ffmpeg@0.12.6 + @ffmpeg/core@0.12.4 (single-threaded, SharedArrayBuffer不要)
  */
+
+// CDN からの FFmpeg のロード状態を管理
+let ffmpegLoadPromise = null;
+let FFmpegModule = null;
+let ffmpegInstance = null;
+
+const FFMPEG_CDN = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js';
+const FFMPEG_CORE_CDN = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js';
+const FFMPEG_WASM_CDN = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm';
+
+/**
+ * FFmpeg.wasm を初回のみ CDN からロードする
+ * （以後はキャッシュ済みのインスタンスを返す）
+ */
+async function getFFmpeg(onLog) {
+  if (ffmpegInstance) return ffmpegInstance;
+
+  if (!ffmpegLoadPromise) {
+    ffmpegLoadPromise = (async () => {
+      // FFmpeg.wasm ライブラリを動的にロード（script tag 挿入）
+      if (!window.FFmpegWASM) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = FFMPEG_CDN;
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('FFmpeg.wasm の読み込みに失敗しました。ネットワーク接続を確認してください。'));
+          document.head.appendChild(script);
+        });
+      }
+
+      // グローバルに公開された FFmpegWASM を取得 (UMD ビルドの公式グローバル名)
+      const { FFmpeg } = window.FFmpegWASM;
+
+      const ff = new FFmpeg();
+
+      if (onLog) {
+        ff.on('log', ({ message }) => {
+          onLog(message);
+        });
+      }
+
+      // シングルスレッドコアをロード（SharedArrayBuffer不要）
+      await ff.load({
+        coreURL: FFMPEG_CORE_CDN,
+        wasmURL: FFMPEG_WASM_CDN,
+      });
+
+      ffmpegInstance = ff;
+      return ff;
+    })();
+  }
+
+  return ffmpegLoadPromise;
+}
+
+/**
+ * Uint8Array (fetch から取得)、または Blob を FFmpeg の仮想 FS に書き込む
+ */
+async function writeFileToFFmpeg(ff, filename, blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
+  await ff.writeFile(filename, uint8Array);
+}
+
 export class VideoExporter {
   constructor() {
     this.isExporting = false;
-    this.videoEl = null;
-    this.canvasEl = null;
-    this.ctx = null;
-    
-    // Web Audio API 関連
-    this.audioCtx = null;
-    this.audioSource = null;
-    this.audioDest = null;
-    
-    // MediaRecorder 関連
-    this.mediaRecorder = null;
-    this.recordedBlobs = [];
+    this._abortController = null;
   }
 
   /**
-   * 書き出しの実行
-   * @param {Array} clips - クリップリスト
-   * @param {number} totalDuration - 総再生時間
+   * FFmpegを事前ロードしておく（UIが描画されたタイミングで呼ぶと初回書き出しが速くなる）
+   */
+  async preload() {
+    try {
+      await getFFmpeg();
+      console.log('FFmpeg.wasm preloaded successfully.');
+    } catch (err) {
+      console.warn('FFmpeg.wasm preload failed (will retry on export):', err);
+    }
+  }
+
+  /**
+   * 書き出しの実行（FFmpeg.wasm ストリームコピー方式）
+   *
+   * @param {Array} clips - クリップリスト [ { objectURL, file, start, end, name } ]
+   * @param {number} totalDuration - 総再生時間（秒）
    * @param {Function} onProgress - 進捗コールバック (0〜100)
    * @param {Function} onComplete - 完了コールバック (Blobを返す)
    * @param {Function} onError - エラーコールバック
    */
-  export(clips, totalDuration, onProgress, onComplete, onError) {
+  async export(clips, totalDuration, onProgress, onComplete, onError) {
     if (this.isExporting) return;
     this.isExporting = true;
-    this.recordedBlobs = [];
 
-    // 1. レンダリング用の隠しビデオ・キャンバス要素を作成
-    this.videoEl = document.createElement('video');
-    this.videoEl.muted = false;
-    this.videoEl.playsInline = true;
-    this.videoEl.webkitPlaysInline = true;
-    this.videoEl.crossOrigin = 'anonymous'; // CORS対策
-
-    this.canvasEl = document.createElement('canvas');
-    this.ctx = this.canvasEl.getContext('2d');
-
-    // 2. Web Audio API のセットアップ (ビデオの音声をキャプチャするため)
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    this.audioCtx = new AudioContextClass();
-    
     try {
-      this.audioSource = this.audioCtx.createMediaElementSource(this.videoEl);
-      this.audioDest = this.audioCtx.createMediaStreamDestination();
-      // 音声出力をデスティネーションに接続 (スピーカーには出力しないのでノイズにならない)
-      this.audioSource.connect(this.audioDest);
-    } catch (e) {
-      console.warn('Web Audio initialization warning, continuing without audio routing:', e);
-    }
-
-    let clipIndex = 0;
-    let currentVirtualTime = 0;
-    let animationId = null;
-    let fps = 30; // 出力フレームレート
-    
-    // 最初のビデオの読み込みとサイズ決定
-    const firstClip = clips[0];
-    this.videoEl.src = firstClip.objectURL;
-    this.videoEl.load();
-
-    this.videoEl.onloadedmetadata = () => {
-      // 解像度を設定 (高解像度すぎるとiPadで重くなるため、最大 1280x720 にリサイズ)
-      let width = this.videoEl.videoWidth || 1280;
-      let height = this.videoEl.videoHeight || 720;
-      
-      const maxDimension = 1280;
-      if (width > maxDimension || height > maxDimension) {
-        if (width > height) {
-          height = Math.round((height * maxDimension) / width);
-          width = maxDimension;
-        } else {
-          width = Math.round((width * maxDimension) / height);
-          height = maxDimension;
-        }
-      }
-
-      this.canvasEl.width = width;
-      this.canvasEl.height = height;
-
-      // 3. MediaRecorder のセットアップ
-      // 映像トラック（Canvasから）と音声トラック（AudioDestinationから）を結合
-      const videoStream = this.canvasEl.captureStream(fps);
-      const videoTrack = videoStream.getVideoTracks()[0];
-      
-      let combinedStream = videoStream;
-      if (this.audioDest && this.audioDest.stream.getAudioTracks().length > 0) {
-        const audioTrack = this.audioDest.stream.getAudioTracks()[0];
-        combinedStream = new MediaStream([videoTrack, audioTrack]);
-      }
-
-      // iOS / iPad OS での動画形式の互換性チェック
-      let options = { mimeType: 'video/mp4' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        // iOS/macOS Safari 等での代替フォーマット
-        options = { mimeType: 'video/quicktime' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-          options = { mimeType: 'video/webm;codecs=vp9' };
-          if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            options = { mimeType: 'video/webm' };
-          }
-        }
-      }
-
-      console.log(`Using mimeType: ${options.mimeType}`);
-
+      // 1. FFmpeg.wasm のロード
+      onProgress(1);
+      let ff;
       try {
-        this.mediaRecorder = new MediaRecorder(combinedStream, options);
+        ff = await getFFmpeg((msg) => console.debug('[FFmpeg]', msg));
       } catch (err) {
-        console.error('Failed to create MediaRecorder:', err);
-        onError(err);
-        this.cleanup();
-        return;
+        throw new Error(`FFmpeg.wasm の初期化に失敗しました: ${err.message}`);
+      }
+      onProgress(5);
+
+      // 一意のセッション ID でファイル名が衝突しないようにする
+      const sessionId = Date.now();
+
+      // 2. ソースファイルを FFmpeg の仮想 FS に書き込む
+      //    同一の objectURL（＝同一ファイル）は1回だけ書き込む
+      const writtenFiles = new Map(); // objectURL → 仮想FSのファイル名
+
+      onProgress(8);
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
+        if (writtenFiles.has(clip.objectURL)) continue;
+
+        const ext = this._getExtension(clip.name);
+        const inputFilename = `input_${sessionId}_${writtenFiles.size}${ext}`;
+
+        // Blob を取得して仮想 FS に書き込む
+        const response = await fetch(clip.objectURL);
+        const blob = await response.blob();
+        await writeFileToFFmpeg(ff, inputFilename, blob);
+
+        writtenFiles.set(clip.objectURL, inputFilename);
+        onProgress(8 + Math.round((i / clips.length) * 30)); // 8% → 38%
       }
 
-      this.mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          this.recordedBlobs.push(event.data);
+      onProgress(40);
+
+      // 3. 各クリップをストリームコピーでトリム → 個別ファイルに出力
+      const trimmedFiles = [];
+
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
+        const inputFilename = writtenFiles.get(clip.objectURL);
+        const outputFilename = `segment_${sessionId}_${i}.mp4`;
+
+        const startSec = clip.start.toFixed(6);
+        const durationSec = (clip.end - clip.start).toFixed(6);
+
+        // -c copy でストリームをコピー（再エンコードなし＝オリジナル画質）
+        // -avoid_negative_ts make_zero: タイムスタンプのずれを防止
+        // -movflags +faststart: Web再生向け最適化
+        await ff.exec([
+          '-ss', startSec,
+          '-i', inputFilename,
+          '-t', durationSec,
+          '-c', 'copy',
+          '-avoid_negative_ts', 'make_zero',
+          '-movflags', '+faststart',
+          outputFilename,
+        ]);
+
+        trimmedFiles.push(outputFilename);
+
+        const progress = 40 + Math.round(((i + 1) / clips.length) * 45); // 40% → 85%
+        onProgress(progress);
+      }
+
+      // 4. 複数クリップを concat demuxer で連結
+      let finalOutputFilename;
+
+      if (trimmedFiles.length === 1) {
+        // クリップが1つだけの場合はそのままでOK
+        finalOutputFilename = trimmedFiles[0];
+      } else {
+        // concat リストファイルを生成（FFmpeg concat demuxer 用）
+        const concatContent = trimmedFiles
+          .map(f => `file '${f}'`)
+          .join('\n');
+
+        const concatFilename = `concat_list_${sessionId}.txt`;
+        const encoder = new TextEncoder();
+        await ff.writeFile(concatFilename, encoder.encode(concatContent));
+
+        finalOutputFilename = `output_${sessionId}.mp4`;
+
+        await ff.exec([
+          '-f', 'concat',
+          '-safe', '0',
+          '-i', concatFilename,
+          '-c', 'copy',
+          '-movflags', '+faststart',
+          finalOutputFilename,
+        ]);
+
+        // 中間ファイルのクリーンアップ
+        for (const segFile of trimmedFiles) {
+          try { await ff.deleteFile(segFile); } catch (_) {}
         }
-      };
+        try { await ff.deleteFile(concatFilename); } catch (_) {}
+      }
 
-      this.mediaRecorder.onstop = () => {
-        const superBuffer = new Blob(this.recordedBlobs, { type: options.mimeType });
-        onComplete(superBuffer);
-        this.cleanup();
-      };
+      onProgress(90);
 
-      // 4. レンダリングおよび録画プロセスの開始
-      this.mediaRecorder.start();
-      
-      // クリップを順番に処理する非同期ループ
-      const processClips = async () => {
-        for (let i = 0; i < clips.length; i++) {
-          if (!this.isExporting) break; // 中断処理用
-          
-          clipIndex = i;
-          const clip = clips[i];
-          
-          // ソースの切り替え（最初のクリップ以外）
-          if (i > 0) {
-            this.videoEl.src = clip.objectURL;
-            this.videoEl.load();
-          }
+      // 5. 出力ファイルを FFmpeg 仮想 FS から読み出す
+      const outputData = await ff.readFile(finalOutputFilename);
+      const outputBlob = new Blob([outputData.buffer], { type: 'video/mp4' });
 
-          // ロードとシーク完了を待つ
-          await new Promise((resolve) => {
-            const onCanPlay = () => {
-              this.videoEl.removeEventListener('canplaythrough', onCanPlay);
-              this.videoEl.currentTime = clip.start;
-              
-              const onSeeked = () => {
-                this.videoEl.removeEventListener('seeked', onSeeked);
-                resolve();
-              };
-              this.videoEl.addEventListener('seeked', onSeeked);
-            };
-            this.videoEl.addEventListener('canplaythrough', onCanPlay);
-          });
+      // 6. 仮想 FS のクリーンアップ
+      try { await ff.deleteFile(finalOutputFilename); } catch (_) {}
+      for (const [, fname] of writtenFiles) {
+        try { await ff.deleteFile(fname); } catch (_) {}
+      }
 
-          // ロード完了後、一時停止解除して録画セグメントを走らせる
-          // iPadブラウザで音声を正しくキャプチャするために、実際に音声を再生させてレコーディングする
-          await this.audioCtx.resume();
-          this.videoEl.play();
+      onProgress(100);
+      onComplete(outputBlob);
 
-          // クリップの再生時間（秒）
-          const segmentDuration = clip.end - clip.start;
-          
-          let lastVideoTime = -1;
-          let lastStallCheckTime = performance.now();
-
-          // Canvasへの描画ループ（クリップごと）
-          await new Promise((resolveSegment) => {
-            const drawFrame = () => {
-              if (!this.isExporting) {
-                cancelAnimationFrame(animationId);
-                resolveSegment();
-                return;
-              }
-
-              // Canvasに動画の現在のフレームを描画
-              this.ctx.drawImage(this.videoEl, 0, 0, width, height);
-
-              const currentVideoTime = this.videoEl.currentTime;
-
-              // 進捗の計算
-              const currentClipProgress = Math.max(0, Math.min(currentVideoTime - clip.start, segmentDuration));
-              const progressTime = currentVirtualTime + currentClipProgress;
-              const percent = Math.min(Math.round((progressTime / totalDuration) * 100), 99);
-              onProgress(percent);
-
-              // 進行が停止していないか（フリーズ防止安全策）
-              const now = performance.now();
-              if (currentVideoTime !== lastVideoTime) {
-                lastVideoTime = currentVideoTime;
-                lastStallCheckTime = now;
-              } else {
-                // currentTimeが進まずに500ms（0.5秒）以上経過した場合
-                if (now - lastStallCheckTime > 500) {
-                  console.warn('Video render stalled, forcing next clip.');
-                  this.videoEl.pause();
-                  currentVirtualTime += segmentDuration;
-                  resolveSegment();
-                  return;
-                }
-              }
-
-              // クリップの終了位置に達したか判定 (iPad/Safariの浮動小数点誤差を考慮して0.08秒手前で終了とみなす)
-              if (currentVideoTime >= clip.end - 0.08 || this.videoEl.ended) {
-                this.videoEl.pause();
-                currentVirtualTime += segmentDuration;
-                resolveSegment();
-              } else {
-                animationId = requestAnimationFrame(drawFrame);
-              }
-            };
-            animationId = requestAnimationFrame(drawFrame);
-          });
-        }
-
-        // 全クリップ終了
-        if (this.isExporting) {
-          onProgress(100);
-          this.mediaRecorder.stop();
-        }
-      };
-
-      processClips().catch((err) => {
-        console.error('Error during exporting clips:', err);
-        onError(err);
-        this.cleanup();
-      });
-    };
-
-    this.videoEl.onerror = (e) => {
-      console.error('Video error during export loading:', e);
-      onError(new Error('動画のロードに失敗しました。'));
-      this.cleanup();
-    };
+    } catch (err) {
+      console.error('Export error:', err);
+      onError(err);
+    } finally {
+      this.isExporting = false;
+    }
   }
 
   /**
-   * 書き出しの強制キャンセル
+   * ファイル名から拡張子を安全に取得する
+   */
+  _getExtension(filename) {
+    if (!filename) return '.mp4';
+    const match = filename.match(/\.[^.]+$/);
+    return match ? match[0].toLowerCase() : '.mp4';
+  }
+
+  /**
+   * 書き出しの強制キャンセル（FFmpeg.wasm は現時点では中断が困難なため、フラグ制御のみ）
    */
   cancel() {
     this.isExporting = false;
-    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-      this.mediaRecorder.stop();
-    }
-    this.cleanup();
-  }
-
-  /**
-   * リソース解放
-   */
-  cleanup() {
-    this.isExporting = false;
-    
-    if (this.videoEl) {
-      this.videoEl.pause();
-      this.videoEl.src = '';
-      this.videoEl = null;
-    }
-    
-    if (this.audioCtx) {
-      this.audioCtx.close();
-      this.audioCtx = null;
-    }
-    
-    this.canvasEl = null;
-    this.ctx = null;
-    this.mediaRecorder = null;
+    console.warn('Export cancel requested. FFmpeg.wasm operation may continue briefly.');
   }
 }
